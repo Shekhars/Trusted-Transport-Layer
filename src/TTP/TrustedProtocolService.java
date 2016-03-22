@@ -1,8 +1,10 @@
 package TTP;
 
 import datatypes.Datagram;
+import services.DatagramService;
 
 import java.io.*;
+import java.util.concurrent.*;
 
 /**
  * Created by Shekhar on 3/20/2016.
@@ -12,28 +14,114 @@ public class TrustedProtocolService {
     int SenderMax; //end of the sender window
     int SenderCurrent; //current frame being sent
     int ReceiverExpected; //expected next packet/frame by receiver
-    int WindowSize; //Window size of Go-Back-N arq
     int Timeout; //Time out in seconds
+    //list of acks received corresponding to each client
+    ConcurrentHashMap<String, ConcurrentSkipListSet<Integer>> Acks;
+    DatagramService ds;
 
 
-    public TrustedProtocolService(int WindowSize, int Timeout) {
+    public TrustedProtocolService(int Timeout, int WindowSize) {
         SenderBase = 0;
         SenderMax = WindowSize;
         SenderCurrent = 0;
         ReceiverExpected = 0;
-        this.WindowSize = WindowSize;
         this.Timeout = Timeout;
     }
 
-    public void SendFrames(Datagram[] datagrams) {
-        while (SenderCurrent <= SenderMax) {
+    /* Client-side method to setup connection with server */
+    public void startConnection(String srcIP, short srcPort, String destIP, short destPort)
+            throws IOException, ClassNotFoundException {
+        final DatagramService ds = new DatagramService(srcPort, 10);
+        short zero = 0;
+        /* Send SYN message */
+        TTPPacket SYN = new TTPPacket(1);
+        SYN.setSyn();
+        Datagram synDatagram = new Datagram(srcIP, destIP, srcPort, destPort, zero, zero, SYN);
+        ds.sendDatagram(synDatagram);
+        final Runnable receiveAcknowledgement = new Thread() {
+            public void run() {
+				/* Receive acknowledgement */
+                Datagram ackDatagram = null;
+                try {
+                    ackDatagram = ds.receiveDatagram();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    return;
+                }
+                TTPPacket ACK = (TTPPacket) ackDatagram.getData();
+                if (ACK.isAcknowledge() && ACK.getAcknowledgementNumber() == 2)
+                    System.out.println("Connection Established");
+                else
+                    System.out.println("Connection error with server");
+            }
+        };
+        final ExecutorService executor = Executors.newSingleThreadExecutor();
+        final Future future = executor.submit(receiveAcknowledgement);
+        executor.shutdown();
+        try {
+            future.get(Timeout, TimeUnit.MILLISECONDS);
+        } catch (Exception te) {
+            System.out.println("Connection Timed Out");
+        }
+        if (!executor.isTerminated())
+            executor.shutdownNow();
+    }
 
+    /* Server side method to accept connection from client */
+    public void acceptConnection(int srcPort) throws IOException, ClassNotFoundException {
+        if (ds == null)
+            ds = new DatagramService(srcPort, 10);
+        Datagram datagram = ds.receiveDatagram();
+        System.out.println("Received datagram from " + datagram.getSrcaddr() + ":" + datagram.getSrcport() + " Data: " + datagram.getData());
+        TTPPacket SYN = (TTPPacket) datagram.getData();
+        if (SYN.isSyn() && SYN.getSequenceNumber() == 1) {
+            TTPPacket ackPac = new TTPPacket(1);
+            ackPac.setAcknowledge();
+            ackPac.setAcknowledgementNumber(2);
+            short zero = 0;
+            Datagram ack = new Datagram(datagram.getDstaddr(), datagram.getSrcaddr(), datagram.getDstport(), datagram.getSrcport(), zero, zero, ackPac);
+            ds.sendDatagram(ack);
         }
     }
 
-    public Object[] RecieveFrames() {
+    public void SendFrames(Datagram[] datagrams, int port) throws
+            IOException {
+        DatagramService datagramService = new DatagramService(port, 10);
+        while (SenderMax <= datagrams.length) {
+            while (SenderCurrent <= SenderMax) {
+                datagramService.sendDatagram(datagrams[SenderCurrent++]);
+            }
+            String destIp = datagrams[SenderCurrent].getDstaddr();
+            int maxAck = -1;
+            if (Acks.containsKey(destIp))
+                maxAck = Acks.get(destIp).last();
+            if (maxAck < SenderBase) {
+                try {
+                    Thread.sleep(Timeout * 1000);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                if (Acks.containsKey(destIp))
+                    maxAck = Acks.get(destIp).last();
+                if (maxAck < SenderBase) {
+                    continue;
+                }
+            }
+            SenderMax = SenderMax + (maxAck - SenderBase);
+            SenderBase = maxAck;
+        }
+    }
 
-        return new Object[0];
+    public void RecieveAcks(int port) throws IOException, ClassNotFoundException {
+        DatagramService datagramService = new DatagramService(port, 10);
+        while (true) {
+            Datagram datagram = null;
+            datagram = datagramService.receiveDatagram();
+            if (datagram != null) {
+                TTPPacket ttpPacket = (TTPPacket) datagram.getData();
+
+            }
+        }
     }
 
     /**
@@ -45,9 +133,9 @@ public class TrustedProtocolService {
      */
     public Datagram[] Chunkify(File file, String srcIP, String destIP,
                                short srcPort, short destPort) throws IOException {
-        int countDatagrams = (int) Math.ceil((file.length()) / 1452);
+        int countDatagrams = (int) Math.ceil((file.length()) / 1451);
         Datagram[] datagrams = new Datagram[countDatagrams];
-        char[] buffer = new char[1452];
+        char[] buffer = new char[1451];
         BufferedReader bufferedReader = new BufferedReader(new FileReader
                 (file.getAbsolutePath()));
         int i = 0;
@@ -57,7 +145,7 @@ public class TrustedProtocolService {
             datagrams[i].setSrcport(srcPort);
             datagrams[i].setDstport(destPort);
             datagrams[i].setChecksum(checksum(new String(buffer).getBytes()));
-
+            //TPPacket ttpPacket = new TTPPacket()
         }
         return datagrams;
     }
